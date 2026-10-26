@@ -1,0 +1,3 @@
+import { ShakeBuilder } from "@/components/shake-builder";
+export const metadata = { title: "Build your shake" };
+export default function BuildPage() { return <main className="bg-[#fffaf1]"><div className="mx-auto max-w-6xl px-4 py-10 sm:px-6 sm:py-14"><p className="text-xs font-black uppercase tracking-[.18em] text-[#8d756b]">Custom shake</p><h1 className="mt-2 font-display text-5xl font-black uppercase leading-none text-[#2f1d16] sm:text-6xl">Make it your way.</h1><p className="mt-3 max-w-xl text-[#705f57]">Choose every part of your shake and get the price immediately.</p><div className="mt-8"><ShakeBuilder/></div></div></main>; }

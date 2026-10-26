@@ -1,0 +1,2 @@
+"use client";
+export default function ErrorPage({reset}:{error:Error&{digest?:string};reset:()=>void}){return <div className="container-shell grid min-h-[60vh] place-items-center text-center"><div><p className="eyebrow">Something went wrong</p><h1 className="mt-2 font-display text-5xl font-black">We couldn’t blend that.</h1><p className="mt-3 text-muted">Please try again. Nothing has been saved.</p><button onClick={reset} className="btn-primary mt-6">Try again</button></div></div>}

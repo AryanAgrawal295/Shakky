@@ -1,0 +1,2 @@
+import Link from "next/link";
+export default function NotFound(){return <div className="container-shell grid min-h-[60vh] place-items-center text-center"><div><p className="eyebrow">404 · Off menu</p><h1 className="mt-2 font-display text-6xl font-black">That blend isn’t here.</h1><p className="mt-3 text-muted">Try the signature menu or make your own from scratch.</p><div className="mt-7 flex justify-center gap-3"><Link className="btn-primary" href="/menu">View menu</Link><Link className="btn-outline" href="/build-your-shake">Build a shake</Link></div></div></div>}
