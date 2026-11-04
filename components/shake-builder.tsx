@@ -4,6 +4,8 @@ import { Check, RotateCcw, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ingredients, type RecipeDef } from "@/lib/catalog";
 import { money, nutritionEstimate, priceShake, type Selection } from "@/lib/pricing";
+import { useCart } from "@/components/cart-provider";
+import { newCartId } from "@/lib/cart";
 
 type BaseId = "milk" | "low-fat-milk" | "water";
 type WheyAmount = 0 | 15 | 30 | 45;
@@ -39,6 +41,7 @@ const addOns = [
   { id: "seeds", title: "Seeds", detail: "15g", imagePosition: "100% 100%", color: "bg-[#cde9c0]" },
 ] as const;
 const portions: Record<string, number> = { milk: 250, "low-fat-milk": 250, water: 250, cocoa: 8, vanilla: 3, coffee: 3, banana: 100, apple: 100, strawberry: 60, blueberry: 60, "peanut-butter": 20, oats: 30, "dry-fruits": 20, seeds: 15 };
+const controlledIngredientIds = new Set(["milk", "low-fat-milk", "water", "whey", "cocoa", "vanilla", "coffee", ...fruits.map((choice) => choice.id), ...addOns.map((choice) => choice.id)]);
 
 function initialValues(recipe?: RecipeDef) {
   const defaults = recipe?.defaults ?? {};
@@ -51,21 +54,26 @@ function initialValues(recipe?: RecipeDef) {
 }
 
 export function ShakeBuilder({ initialRecipe }: { initialRecipe?: RecipeDef }) {
+  const { add } = useCart();
   const initial = initialValues(initialRecipe);
   const [base, setBase] = useState<BaseId>(initial.base);
   const [whey, setWhey] = useState<WheyAmount>(initial.whey);
   const [flavour, setFlavour] = useState<FlavourId>(initial.flavour);
   const [addons, setAddons] = useState<string[]>(initial.extras);
+  const recipeOnlySelections = useMemo<Selection[]>(() => initialRecipe ? Object.entries(initialRecipe.defaults).filter(([ingredientId]) => !controlledIngredientIds.has(ingredientId)).map(([ingredientId, quantity]) => ({ ingredientId, quantity })) : [], [initialRecipe]);
   const selections = useMemo<Selection[]>(() => [
-    { ingredientId: base, quantity: portions[base] },
-    ...(whey ? [{ ingredientId: "whey", quantity: whey }] : []),
-    ...(flavour !== "none" ? [{ ingredientId: flavour, quantity: portions[flavour] }] : []),
-    ...addons.map((ingredientId) => ({ ingredientId, quantity: portions[ingredientId] })),
-  ], [addons, base, flavour, whey]);
-  const quote = useMemo(() => priceShake(initialRecipe ?? null, selections, ingredients), [initialRecipe, selections]);
+    { ingredientId: base, quantity: initialRecipe?.defaults[base] ?? portions[base] },
+    ...(whey ? [{ ingredientId: "whey", quantity: whey === initial.whey ? (initialRecipe?.defaults.whey ?? whey) : whey }] : []),
+    ...(flavour !== "none" ? [{ ingredientId: flavour, quantity: initialRecipe?.defaults[flavour] ?? portions[flavour] }] : []),
+    ...addons.map((ingredientId) => ({ ingredientId, quantity: initialRecipe?.defaults[ingredientId] ?? portions[ingredientId] })),
+    ...recipeOnlySelections,
+  ], [addons, base, flavour, initial.whey, initialRecipe, recipeOnlySelections, whey]);
+  const quote = useMemo(() => priceShake(null, selections, ingredients), [selections]);
   const nutrition = useMemo(() => nutritionEstimate(selections, ingredients), [selections]);
   const selectedNames = quote.lines.map((line) => line.name).join(" · ");
+  const [added, setAdded] = useState(false);
   const reset = () => { setBase(initial.base); setWhey(initial.whey); setFlavour(initial.flavour); setAddons(initial.extras); };
+  const addToCart = () => { if (!quote.valid) return; add({ id: newCartId(), recipeSlug: initialRecipe?.slug, name: initialRecipe?.name ?? "Custom Shake", itemType: initialRecipe ? "SIGNATURE" : "CUSTOM", selections, quantity: 1 }); setAdded(true); window.setTimeout(() => setAdded(false), 2200); };
 
   return <section className="relative grid items-start gap-5 pb-24 lg:grid-cols-[minmax(0,1fr)_340px] lg:pb-0">
     <div className="space-y-4">
@@ -87,7 +95,7 @@ export function ShakeBuilder({ initialRecipe }: { initialRecipe?: RecipeDef }) {
     </div>
     <aside className="overflow-hidden rounded-[2rem] bg-[#2f1d16] text-white shadow-[0_20px_60px_rgba(76,38,27,.22)] lg:sticky lg:top-6">
       <div className="bg-[#ef5f87] px-6 py-5 text-[#2f1d16]"><Sparkles size={22}/><p className="mt-3 text-xs font-black uppercase tracking-[0.17em]">Your custom shake</p><p className="mt-1 text-sm font-semibold leading-5 opacity-75">{selectedNames}</p></div>
-      <div className="p-6"><p className="text-xs font-black uppercase tracking-[0.16em] text-[#d9ff63]">Your price</p><p className="mt-2 font-display text-6xl font-black leading-none">{money(quote.sellingPricePaise)}</p><p className="mt-3 text-sm text-white/65">Includes every choice above.</p><div className="mt-6 border-y border-white/15 py-4 text-center"><b className="font-display text-2xl">{Math.round(nutrition.protein)}g</b><span className="block text-[10px] font-bold uppercase tracking-wider text-white/55">Protein</span></div><button type="button" onClick={reset} className="mt-4 inline-flex min-h-11 items-center gap-2 text-sm font-bold text-white/75 transition hover:text-white"><RotateCcw size={16}/>Start again</button></div>
+      <div className="p-6"><p className="text-xs font-black uppercase tracking-[0.16em] text-[#d9ff63]">Your price</p><p className="mt-2 font-display text-6xl font-black leading-none">{money(quote.sellingPricePaise)}</p><div className="mt-4 space-y-2 border-y border-white/15 py-4 text-sm">{quote.lines.map((line) => <div className="flex justify-between gap-3" key={line.ingredientId}><span>{line.name} · {line.quantity}{line.unit === "MILLILITRE" ? "ml" : "g"}</span><span>{money(line.customerChargePaise)}</span></div>)}<div className="flex justify-between gap-3 pt-2 font-bold text-[#d9ff63]"><span>Blend &amp; Cup Fee</span><span>{money(quote.blendAndCupFeePaise)}</span></div></div><div className="border-b border-white/15 py-4 text-center"><b className="font-display text-2xl">{Math.round(nutrition.protein)}g</b><span className="block text-[10px] font-bold uppercase tracking-wider text-white/55">Protein</span></div><button type="button" onClick={addToCart} className="mt-4 min-h-12 w-full rounded-xl bg-[#c9f45b] px-4 text-sm font-black text-[#2f1d16] transition hover:bg-white">{added ? "Added to cart ✓" : "Add shake to cart"}</button><button type="button" onClick={reset} className="mt-3 inline-flex min-h-11 items-center gap-2 text-sm font-bold text-white/75 transition hover:text-white"><RotateCcw size={16}/>Start again</button></div>
     </aside>
     <div className="fixed inset-x-3 bottom-3 z-40 rounded-2xl bg-[#2f1d16] p-3 text-white shadow-2xl lg:hidden"><div className="flex items-center justify-between gap-3"><div><p className="text-[10px] font-black uppercase tracking-[0.14em] text-[#d9ff63]">Your shake price</p><p className="font-display text-3xl font-black leading-none">{money(quote.sellingPricePaise)}</p></div><span className="rounded-xl bg-[#ef5f87] px-3 py-2 text-xs font-black text-[#2f1d16]">Live total</span></div></div>
   </section>;
