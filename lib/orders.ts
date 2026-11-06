@@ -1,41 +1,97 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import Database from "better-sqlite3";
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
+import { MongoClient } from "mongodb";
 import { ingredients, recipes } from "@/lib/catalog";
 import { priceShake, type Selection } from "@/lib/pricing";
 import type { CartItem, OrderStatus, PaymentStatus } from "@/lib/order-types";
 
-const dbPath = process.env.SHAKE_LAB_DB_PATH || path.join(process.cwd(), "data", "shake-lab.sqlite");
-let database: Database.Database | undefined;
-function db() { if (!database) { fs.mkdirSync(path.dirname(dbPath), { recursive: true }); database = new Database(dbPath); database.pragma("journal_mode = WAL"); database.exec(`CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, public_id TEXT UNIQUE NOT NULL, receipt_token TEXT UNIQUE NOT NULL, customer_name TEXT NOT NULL, customer_phone TEXT NOT NULL, customer_note TEXT, pickup_location TEXT NOT NULL, order_status TEXT NOT NULL, payment_status TEXT NOT NULL, payment_acknowledged INTEGER NOT NULL, payment_acknowledged_at TEXT, subtotal INTEGER NOT NULL, additional_charges INTEGER NOT NULL DEFAULT 0, total_amount INTEGER NOT NULL, idempotency_key TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, completed_by TEXT); CREATE TABLE IF NOT EXISTS order_items (id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id), recipe_slug TEXT, recipe_name_snapshot TEXT NOT NULL, item_type TEXT NOT NULL, quantity INTEGER NOT NULL, unit_price INTEGER NOT NULL, line_total INTEGER NOT NULL, image_slug TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS order_item_ingredients (id TEXT PRIMARY KEY, order_item_id TEXT NOT NULL REFERENCES order_items(id), ingredient_id TEXT NOT NULL, ingredient_name_snapshot TEXT NOT NULL, quantity REAL NOT NULL, unit TEXT NOT NULL, customer_rate_snapshot REAL NOT NULL, ingredient_charge_snapshot INTEGER NOT NULL, internal_cost_snapshot INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS order_status_history (id TEXT PRIMARY KEY, order_id TEXT NOT NULL, previous_status TEXT, new_status TEXT NOT NULL, changed_by TEXT, reason TEXT, timestamp TEXT NOT NULL); CREATE TABLE IF NOT EXISTS payment_history (id TEXT PRIMARY KEY, order_id TEXT NOT NULL, previous_status TEXT, new_status TEXT NOT NULL, changed_by TEXT, reason TEXT, timestamp TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC); CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(order_status);`); } return database; }
+type StoredOrder = { id: string; public_id: string; receipt_token: string; customer_name: string; customer_phone: string; customer_note: string | null; pickup_location: string; order_status: OrderStatus; payment_status: PaymentStatus; payment_acknowledged: number; payment_acknowledged_at: string | null; subtotal: number; additional_charges: number; total_amount: number; idempotency_key: string; created_at: string; updated_at: string; completed_at: string | null; completed_by: string | null };
+type StoredItem = { id: string; order_id: string; recipe_slug: string | null; recipe_name_snapshot: string; item_type: "SIGNATURE" | "CUSTOM"; quantity: number; unit_price: number; line_total: number; image_slug: string | null; created_at: string };
+type StoredIngredient = { id: string; order_item_id: string; ingredient_id: string; ingredient_name_snapshot: string; quantity: number; unit: string; customer_rate_snapshot: number; ingredient_charge_snapshot: number; internal_cost_snapshot: number };
+type HydratedOrder = StoredOrder & { items: Array<StoredItem & { ingredients: StoredIngredient[] }> };
+
+declare global { var shakeLabMongo: Promise<MongoClient> | undefined; var shakeLabMongoIndexes: Promise<void> | undefined; }
+
 const uuid = () => crypto.randomUUID();
 const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-function orderCode() { return `SL-${Array.from(crypto.randomBytes(7), b => alphabet[b % alphabet.length]).join("")}`; }
+const orderCode = () => `SL-${Array.from(crypto.randomBytes(7), byte => alphabet[byte % alphabet.length]).join("")}`;
+
+async function database() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error("MONGODB_URI is not configured. Add it to your environment variables.");
+  if (!global.shakeLabMongo) global.shakeLabMongo = new MongoClient(uri).connect();
+  const client = await global.shakeLabMongo;
+  const db = client.db(process.env.MONGODB_DB || "shake_lab");
+  if (!global.shakeLabMongoIndexes) global.shakeLabMongoIndexes = Promise.all([
+    db.collection<StoredOrder>("orders").createIndex({ public_id: 1 }, { unique: true }),
+    db.collection<StoredOrder>("orders").createIndex({ receipt_token: 1 }, { unique: true }),
+    db.collection<StoredOrder>("orders").createIndex({ idempotency_key: 1 }, { unique: true }),
+    db.collection<StoredOrder>("orders").createIndex({ created_at: -1 }),
+    db.collection<StoredItem>("order_items").createIndex({ order_id: 1 }),
+    db.collection<StoredIngredient>("order_item_ingredients").createIndex({ order_item_id: 1 }),
+  ]).then(() => undefined);
+  await global.shakeLabMongoIndexes;
+  return { client, db };
+}
+
 export function validatePhone(phone: string) { return /^[6-9]\d{9}$/.test(phone.replace(/\D/g, "")); }
+
 function snapshotItem(input: CartItem) {
   if (!input || !Array.isArray(input.selections) || !Number.isInteger(input.quantity) || input.quantity < 1 || input.quantity > 20) throw new Error("Each shake quantity must be between 1 and 20.");
-  const recipe = input.recipeSlug ? recipes.find((entry) => entry.slug === input.recipeSlug) : undefined;
+  const recipe = input.recipeSlug ? recipes.find(entry => entry.slug === input.recipeSlug) : undefined;
   if (input.itemType === "SIGNATURE" && !recipe) throw new Error("That signature shake is no longer available.");
-  const selections: Selection[] = input.selections.map((selection) => ({ ingredientId: String(selection.ingredientId), quantity: Number(selection.quantity) }));
-  const quote = priceShake(recipe ?? null, selections, ingredients); if (!quote.valid) throw new Error(quote.error ?? "Choose a liquid base.");
-  return { recipe, name: recipe?.name ?? "Custom Shake", quote, quantity: input.quantity, selections };
+  const selections: Selection[] = input.selections.map(selection => ({ ingredientId: String(selection.ingredientId), quantity: Number(selection.quantity) }));
+  const quote = priceShake(recipe ?? null, selections, ingredients);
+  if (!quote.valid) throw new Error(quote.error ?? "Choose a liquid base.");
+  return { recipe, name: recipe?.name ?? "Custom Shake", quote, quantity: input.quantity };
 }
-export function createOrder(input: { items: CartItem[]; customerName: string; customerPhone: string; customerNote?: string; paymentAcknowledged: boolean; idempotencyKey: string }) {
+
+export async function createOrder(input: { items: CartItem[]; customerName: string; customerPhone: string; customerNote?: string; paymentAcknowledged: boolean; idempotencyKey: string }) {
   const name = input.customerName.trim(); const phone = input.customerPhone.replace(/\D/g, ""); const note = input.customerNote?.trim() || null;
-  if (!name || name.length > 80) throw new Error("Enter a name of up to 80 characters."); if (!validatePhone(phone)) throw new Error("Enter a valid 10-digit mobile number."); if (note && note.length > 300) throw new Error("Order note must be 300 characters or fewer."); if (!input.paymentAcknowledged) throw new Error("Confirm your payment acknowledgement before placing the order."); if (!input.idempotencyKey || input.idempotencyKey.length > 200) throw new Error("Invalid order request."); if (!Array.isArray(input.items) || !input.items.length || input.items.length > 20) throw new Error("Your cart must contain between 1 and 20 shakes.");
-  const store = db(); const existing = store.prepare("SELECT public_id, receipt_token FROM orders WHERE idempotency_key = ?").get(input.idempotencyKey) as { public_id: string; receipt_token: string } | undefined; if (existing) return { publicOrderId: existing.public_id, receiptToken: existing.receipt_token, existing: true };
-  const items = input.items.map(snapshotItem); const subtotal = items.reduce((sum, item) => sum + item.quote.sellingPricePaise * item.quantity, 0); const now = new Date().toISOString(); const id = uuid(); const receiptToken = crypto.randomBytes(24).toString("base64url");
-  const insert = store.transaction(() => { let code = orderCode(); for (let attempts = 0; attempts < 10; attempts++) { try { store.prepare("INSERT INTO orders (id,public_id,receipt_token,customer_name,customer_phone,customer_note,pickup_location,order_status,payment_status,payment_acknowledged,payment_acknowledged_at,subtotal,total_amount,idempotency_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id, code, receiptToken, name, phone, note, "SHAKE LAB counter", "PLACED", "CUSTOMER_CLAIMED_PAID", 1, now, subtotal, subtotal, input.idempotencyKey, now, now); break; } catch (error) { if (attempts === 9) throw error; code = orderCode(); } }
-    for (const item of items) { const itemId = uuid(); const unitPrice = item.quote.sellingPricePaise; store.prepare("INSERT INTO order_items (id,order_id,recipe_slug,recipe_name_snapshot,item_type,quantity,unit_price,line_total,image_slug,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(itemId,id,item.recipe?.slug ?? null,item.name,item.recipe ? "SIGNATURE" : "CUSTOM",item.quantity,unitPrice,unitPrice*item.quantity,item.recipe?.slug ?? null,now); for (const line of item.quote.lines) { const ing = ingredients.find(i => i.id === line.ingredientId)!; store.prepare("INSERT INTO order_item_ingredients (id,order_item_id,ingredient_id,ingredient_name_snapshot,quantity,unit,customer_rate_snapshot,ingredient_charge_snapshot,internal_cost_snapshot) VALUES (?,?,?,?,?,?,?,?,?)").run(uuid(),itemId,ing.id,ing.name,line.quantity,line.unit,ing.customerPaisePerUnit,line.customerChargePaise,Math.round(line.quantity*ing.costPaisePerUnit)); } }
-    store.prepare("INSERT INTO order_status_history (id,order_id,new_status,timestamp) VALUES (?,?,?,?)").run(uuid(),id,"PLACED",now); store.prepare("INSERT INTO payment_history (id,order_id,new_status,timestamp) VALUES (?,?,?,?)").run(uuid(),id,"CUSTOMER_CLAIMED_PAID",now); return code;
-  }); const code = insert(); return { publicOrderId: code, receiptToken, existing: false };
+  if (!name || name.length > 80) throw new Error("Enter a name of up to 80 characters.");
+  if (!validatePhone(phone)) throw new Error("Enter a valid 10-digit mobile number.");
+  if (note && note.length > 300) throw new Error("Order note must be 300 characters or fewer.");
+  if (!input.paymentAcknowledged) throw new Error("Confirm your payment acknowledgement before placing the order.");
+  if (!input.idempotencyKey || input.idempotencyKey.length > 200) throw new Error("Invalid order request.");
+  if (!Array.isArray(input.items) || !input.items.length || input.items.length > 20) throw new Error("Your cart must contain between 1 and 20 shakes.");
+  const { client, db } = await database(); const orders = db.collection<StoredOrder>("orders");
+  const existing = await orders.findOne({ idempotency_key: input.idempotencyKey });
+  if (existing) return { publicOrderId: existing.public_id, receiptToken: existing.receipt_token, existing: true };
+  const snapshots = input.items.map(snapshotItem); const subtotal = snapshots.reduce((sum, item) => sum + item.quote.sellingPricePaise * item.quantity, 0);
+  const now = new Date().toISOString(); const id = uuid(); const receiptToken = crypto.randomBytes(24).toString("base64url");
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const publicId = orderCode(); const session = client.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const duplicate = await orders.findOne({ idempotency_key: input.idempotencyKey }, { session });
+        if (duplicate) throw new Error("DUPLICATE_ORDER");
+        const order: StoredOrder = { id, public_id: publicId, receipt_token: receiptToken, customer_name: name, customer_phone: phone, customer_note: note, pickup_location: "SHAKE LAB counter", order_status: "PLACED", payment_status: "CUSTOMER_CLAIMED_PAID", payment_acknowledged: 1, payment_acknowledged_at: now, subtotal, additional_charges: 0, total_amount: subtotal, idempotency_key: input.idempotencyKey, created_at: now, updated_at: now, completed_at: null, completed_by: null };
+        await orders.insertOne(order, { session });
+        const itemDocs: StoredItem[] = []; const ingredientDocs: StoredIngredient[] = [];
+        for (const snapshot of snapshots) { const itemId = uuid(); itemDocs.push({ id: itemId, order_id: id, recipe_slug: snapshot.recipe?.slug ?? null, recipe_name_snapshot: snapshot.name, item_type: snapshot.recipe ? "SIGNATURE" : "CUSTOM", quantity: snapshot.quantity, unit_price: snapshot.quote.sellingPricePaise, line_total: snapshot.quote.sellingPricePaise * snapshot.quantity, image_slug: snapshot.recipe?.slug ?? null, created_at: now }); for (const line of snapshot.quote.lines) { const ingredient = ingredients.find(entry => entry.id === line.ingredientId)!; ingredientDocs.push({ id: uuid(), order_item_id: itemId, ingredient_id: ingredient.id, ingredient_name_snapshot: ingredient.name, quantity: line.quantity, unit: line.unit, customer_rate_snapshot: ingredient.customerPaisePerUnit, ingredient_charge_snapshot: line.customerChargePaise, internal_cost_snapshot: Math.round(line.quantity * ingredient.costPaisePerUnit) }); } }
+        await db.collection<StoredItem>("order_items").insertMany(itemDocs, { session });
+        await db.collection<StoredIngredient>("order_item_ingredients").insertMany(ingredientDocs, { session });
+        await db.collection("order_status_history").insertOne({ id: uuid(), order_id: id, previous_status: null, new_status: "PLACED", changed_by: null, reason: null, timestamp: now }, { session });
+        await db.collection("payment_history").insertOne({ id: uuid(), order_id: id, previous_status: null, new_status: "CUSTOMER_CLAIMED_PAID", changed_by: null, reason: null, timestamp: now }, { session });
+      });
+      return { publicOrderId: publicId, receiptToken, existing: false };
+    } catch (error) {
+      if (error instanceof Error && error.message === "DUPLICATE_ORDER") { const duplicate = await orders.findOne({ idempotency_key: input.idempotencyKey }); if (duplicate) return { publicOrderId: duplicate.public_id, receiptToken: duplicate.receipt_token, existing: true }; }
+      if (!(typeof error === "object" && error && "code" in error && (error as { code?: number }).code === 11000)) throw error;
+    } finally { await session.endSession(); }
+  }
+  throw new Error("Could not generate a unique order ID. Please try again.");
 }
-function hydrateOrder(row: Record<string, unknown>): Record<string, any> { const store = db(); const items = store.prepare("SELECT * FROM order_items WHERE order_id=?").all(row.id) as Record<string, unknown>[]; return { ...row, items: items.map(item => ({ ...item, ingredients: store.prepare("SELECT ingredient_name_snapshot,quantity,unit,ingredient_charge_snapshot FROM order_item_ingredients WHERE order_item_id=?").all(item.id) })) }; }
-export function customerOrder(code: string, token: string) { const row = db().prepare("SELECT * FROM orders WHERE public_id=? AND receipt_token=?").get(code.toUpperCase(), token) as Record<string, unknown> | undefined; return row ? hydrateOrder(row) : null; }
-export function listOrders(query = "") { const q = `%${query.trim()}%`; const rows = db().prepare("SELECT * FROM orders WHERE public_id LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ? ORDER BY created_at DESC LIMIT 100").all(q,q,q) as Record<string, unknown>[]; return rows.map(hydrateOrder); }
-export function adminOrder(code: string) { const row = db().prepare("SELECT * FROM orders WHERE public_id=?").get(code.toUpperCase()) as Record<string, unknown> | undefined; return row ? hydrateOrder(row) : null; }
+
+async function hydrateOrder(order: StoredOrder, db: Awaited<ReturnType<typeof database>>["db"]): Promise<HydratedOrder> {
+  const items = await db.collection<StoredItem>("order_items").find({ order_id: order.id }).toArray();
+  const ingredientsByItem = await Promise.all(items.map(async item => ({ itemId: item.id, ingredients: await db.collection<StoredIngredient>("order_item_ingredients").find({ order_item_id: item.id }).toArray() })));
+  return { ...order, items: items.map(item => ({ ...item, ingredients: ingredientsByItem.find(entry => entry.itemId === item.id)?.ingredients ?? [] })) };
+}
+
+export async function customerOrder(code: string, token: string) { const { db } = await database(); const order = await db.collection<StoredOrder>("orders").findOne({ public_id: code.toUpperCase(), receipt_token: token }); return order ? hydrateOrder(order, db) : null; }
+export async function listOrders(query = "") { const { db } = await database(); const trimmed = query.trim(); const filter = trimmed ? { $or: [{ public_id: { $regex: trimmed, $options: "i" } }, { customer_name: { $regex: trimmed, $options: "i" } }, { customer_phone: { $regex: trimmed } }] } : {}; const orders = await db.collection<StoredOrder>("orders").find(filter).sort({ created_at: -1 }).limit(100).toArray(); return Promise.all(orders.map(order => hydrateOrder(order, db))); }
+export async function adminOrder(code: string) { const { db } = await database(); const order = await db.collection<StoredOrder>("orders").findOne({ public_id: code.toUpperCase() }); return order ? hydrateOrder(order, db) : null; }
+
 const transitions: Record<OrderStatus, OrderStatus[]> = { PLACED:["ACCEPTED","REJECTED","CANCELLED"], ACCEPTED:["PREPARING","CANCELLED","REJECTED"], PREPARING:["READY_FOR_PICKUP","CANCELLED"], READY_FOR_PICKUP:["COMPLETED"], COMPLETED:[], CANCELLED:[], REJECTED:[] };
-export function updateOrder(code: string, next: OrderStatus, admin: string, reason?: string) { const order = adminOrder(code); if (!order) throw new Error("Order not found."); const previous = order.order_status as OrderStatus; if (!transitions[previous].includes(next)) throw new Error(`Cannot change ${previous} to ${next}.`); const now = new Date().toISOString(); db().transaction(() => { db().prepare("UPDATE orders SET order_status=?,updated_at=?,completed_at=?,completed_by=? WHERE id=?").run(next,now,next === "COMPLETED" ? now : null,next === "COMPLETED" ? admin : null,order.id); db().prepare("INSERT INTO order_status_history (id,order_id,previous_status,new_status,changed_by,reason,timestamp) VALUES (?,?,?,?,?,?,?)").run(uuid(),order.id,previous,next,admin,reason ?? null,now); })(); return adminOrder(code)!; }
-export function updatePayment(code: string, next: PaymentStatus, admin: string, reason?: string) { const order=adminOrder(code); if (!order) throw new Error("Order not found."); const previous=order.payment_status as PaymentStatus; if (!(["VERIFIED","REJECTED"] as PaymentStatus[]).includes(next)) throw new Error("Invalid payment update."); const now=new Date().toISOString(); db().transaction(()=>{ db().prepare("UPDATE orders SET payment_status=?,updated_at=? WHERE id=?").run(next,now,order.id); db().prepare("INSERT INTO payment_history (id,order_id,previous_status,new_status,changed_by,reason,timestamp) VALUES (?,?,?,?,?,?,?)").run(uuid(),order.id,previous,next,admin,reason ?? null,now); })(); return adminOrder(code)!; }
+export async function updateOrder(code: string, next: OrderStatus, admin: string, reason?: string) { const { client, db } = await database(); const order = await db.collection<StoredOrder>("orders").findOne({ public_id: code.toUpperCase() }); if (!order) throw new Error("Order not found."); if (!transitions[order.order_status].includes(next)) throw new Error(`Cannot change ${order.order_status} to ${next}.`); const now = new Date().toISOString(); const session = client.startSession(); try { await session.withTransaction(async () => { await db.collection<StoredOrder>("orders").updateOne({ id: order.id, order_status: order.order_status }, { $set: { order_status: next, updated_at: now, completed_at: next === "COMPLETED" ? now : null, completed_by: next === "COMPLETED" ? admin : null } }, { session }); await db.collection("order_status_history").insertOne({ id: uuid(), order_id: order.id, previous_status: order.order_status, new_status: next, changed_by: admin, reason: reason ?? null, timestamp: now }, { session }); }); } finally { await session.endSession(); } return adminOrder(code) as Promise<HydratedOrder>; }
+export async function updatePayment(code: string, next: PaymentStatus, admin: string, reason?: string) { const { client, db } = await database(); const order = await db.collection<StoredOrder>("orders").findOne({ public_id: code.toUpperCase() }); if (!order) throw new Error("Order not found."); if (next !== "VERIFIED" && next !== "REJECTED") throw new Error("Invalid payment update."); const now = new Date().toISOString(); const session = client.startSession(); try { await session.withTransaction(async () => { await db.collection<StoredOrder>("orders").updateOne({ id: order.id }, { $set: { payment_status: next, updated_at: now } }, { session }); await db.collection("payment_history").insertOne({ id: uuid(), order_id: order.id, previous_status: order.payment_status, new_status: next, changed_by: admin, reason: reason ?? null, timestamp: now }, { session }); }); } finally { await session.endSession(); } return adminOrder(code) as Promise<HydratedOrder>; }

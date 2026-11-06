@@ -10,7 +10,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. Orders are stored automatically in `data/shake-lab.sqlite`; no Postgres server or Prisma migration is needed.
+Open `http://localhost:3000`. Orders are stored in MongoDB Atlas. Add `MONGODB_URI` and `MONGODB_DB` to your local `.env` and Vercel Environment Variables; no Postgres server or Prisma migration is needed.
 
 For staff access, open `/admin/login` and use `SHAKE_LAB_ADMIN_PASSWORD` from `.env`. Change both admin environment values before deployment.
 
@@ -20,7 +20,7 @@ For staff access, open `/admin/login` and use `SHAKE_LAB_ADMIN_PASSWORD` from `.
 - Server-side ingredient validation and repricing at checkout.
 - Required payment acknowledgement; it is recorded as **customer claimed paid**, never as a gateway payment.
 - Cryptographically random `SL-XXXXXXX` pickup code plus a separate secure receipt token.
-- SQLite order snapshots for historical ingredients, portions and prices.
+- MongoDB order snapshots for historical ingredients, portions and prices.
 - Protected staff order list, search, live 15-second refresh, payment verification, preparation status, and pickup handover.
 
 ## Verify
